@@ -1,179 +1,320 @@
 package config
 
 import (
-    "context"
-    "encoding/json"
-    "fmt"
-    "os"
-    "strconv"
-    "strings"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
 
-    box "github.com/sagernet/sing-box"
-    "github.com/sagernet/sing-box/include"
-    "github.com/sagernet/sing-box/option"
+	box "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/include"
+	"github.com/sagernet/sing-box/option"
 )
 
-// ServerEntry – одна запись в вашем серверном JSON
+type TLSConfig struct {
+	Enabled    bool   `json:"enabled"`
+	Insecure   bool   `json:"insecure"`
+	ServerName string `json:"serverName"`
+}
+
+type RealityConfig struct {
+	PublicKey   string `json:"publicKey"`
+	ShortID     string `json:"shortId"`
+	Fingerprint string `json:"fingerprint"`
+	ServerName  string `json:"serverName"`
+	SpiderX     string `json:"spiderX"`
+}
+
 type ServerEntry struct {
-    Name          string `json:"name"`
-    Type          string `json:"type"`
-    Server        string `json:"server"`
-    Username      string `json:"username"`
-    Password      string `json:"password"`
-    Insecure      bool   `json:"insecure"`
-    AllowInsecure bool   `json:"allowInsecure"`
+	Name     string        `json:"name"`
+	Type     string        `json:"type"`
+	Server   string        `json:"server"`
+	UUID     string        `json:"uuid"`
+	Password string        `json:"password"`
+	TLS      TLSConfig     `json:"tls"`
+	Reality  RealityConfig `json:"reality"`
+
+	// Hysteria2
+	UpMbps   int `json:"upMbps"`
+	DownMbps int `json:"downMbps"`
+
+	// VMess/VLESS transport
+	Network string `json:"network"`
+	Path    string `json:"path"`
+	Host    string `json:"host"`
+
+	// VMess
+	AlterID int `json:"alterId"`
+
+	// VLESS flow (для Reality: xtls-rprx-vision)
+	Flow string `json:"flow"`
+
+	// Shadowsocks
+	Method string `json:"method"`
 }
 
-// ServersConfig – корневая структура файла профилей
 type ServersConfig struct {
-    Servers []ServerEntry `json:"servers"`
+	Servers []ServerEntry `json:"servers"`
 }
 
-// LoadServerByName читает файл профилей, ищет сервер по имени и возвращает option.Options
+func LoadServers(configPath string) ([]ServerEntry, error) {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("read servers config: %w", err)
+	}
+	var cfg ServersConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse servers config: %w", err)
+	}
+	return cfg.Servers, nil
+}
+
 func LoadServerByName(configPath string, serverName string) (option.Options, error) {
-    data, err := os.ReadFile(configPath)
-    if err != nil {
-        return option.Options{}, fmt.Errorf("read servers config: %w", err)
-    }
-
-    var serversCfg ServersConfig
-    if err := json.Unmarshal(data, &serversCfg); err != nil {
-        return option.Options{}, fmt.Errorf("parse servers config: %w", err)
-    }
-
-    var target *ServerEntry
-    for _, s := range serversCfg.Servers {
-        if s.Name == serverName {
-            target = &s
-            break
-        }
-    }
-    if target == nil {
-        return option.Options{}, fmt.Errorf("server '%s' not found", serverName)
-    }
-
-    return buildOptions(*target)
+	servers, err := LoadServers(configPath)
+	if err != nil {
+		return option.Options{}, err
+	}
+	for _, s := range servers {
+		if s.Name == serverName {
+			return buildOptions(s)
+		}
+	}
+	return option.Options{}, fmt.Errorf("server %q not found", serverName)
 }
 
-// buildOptions создаёт стандартный JSON-конфиг Sing-Box и парсит в option.Options
+func BuildOptionsForServer(s ServerEntry) (option.Options, error) {
+	return buildOptions(s)
+}
+
 func buildOptions(s ServerEntry) (option.Options, error) {
-    // Базовый конфиг: SOCKS-вход + outbound выбранного типа
-    cfg := map[string]interface{}{
-        "log": map[string]interface{}{
-            "level": "debug",
-        },
-        "dns": map[string]interface{}{
-            "servers": []interface{}{
-                map[string]interface{}{
-                    "address":  "1.1.1.1",
-                    "detour":   "direct",
-                },
-                map[string]interface{}{
-                    "address":  "8.8.8.8",
-                    "detour":   "direct",
-                },
-            },
-        },
-        "inbounds": []interface{}{
-            map[string]interface{}{
-                "type":        "socks",
-                "tag":         "socks-in",
-                "listen":      "127.0.0.1",
-                "listen_port": 1080,
-            },
-            map[string]interface{}{
-                "type":        "http",
-                "tag":         "http-in",
-                "listen":      "127.0.0.1",
-                "listen_port": 1081,
-            },
-        },
-        "outbounds": []interface{}{
-            buildOutboundMap(s),
-            map[string]interface{}{
-                "type": "direct",
-                "tag":  "direct",
-            },
-        },
-        "route": map[string]interface{}{
-            "rules": []interface{}{
-                map[string]interface{}{
-                    "port":       53,
-                    "network":    "udp",
-                    "outbound":   "direct",
-                },
-            },
-        },
-    }
+	outbound, err := buildOutboundMap(s)
+	if err != nil {
+		return option.Options{}, err
+	}
 
-    // Маршалим в JSON
-    jsonBytes, err := json.Marshal(cfg)
-    if err != nil {
-        return option.Options{}, fmt.Errorf("marshal config: %w", err)
-    }
+	cfg := map[string]interface{}{
+		"log": map[string]interface{}{
+			"level": "info",
+		},
+		"dns": map[string]interface{}{
+			"servers": []interface{}{
+				map[string]interface{}{"address": "1.1.1.1", "detour": "direct"},
+				map[string]interface{}{"address": "8.8.8.8", "detour": "direct"},
+			},
+		},
+		"inbounds": []interface{}{
+			map[string]interface{}{
+				"type":        "socks",
+				"tag":         "socks-in",
+				"listen":      "127.0.0.1",
+				"listen_port": 1080,
+			},
+			map[string]interface{}{
+				"type":        "http",
+				"tag":         "http-in",
+				"listen":      "127.0.0.1",
+				"listen_port": 1081,
+			},
+		},
+		"outbounds": []interface{}{
+			outbound,
+			map[string]interface{}{"type": "direct", "tag": "direct"},
+			map[string]interface{}{"type": "block", "tag": "block"},
+		},
+		"route": map[string]interface{}{
+			"rules": []interface{}{
+				map[string]interface{}{
+					"port":     53,
+					"network":  "udp",
+					"outbound": "direct",
+				},
+			},
+		},
+	}
 
-    // Выводим конфиг для отладки
-    fmt.Fprintf(os.Stderr, "Generated config: %s\n", string(jsonBytes))
+	jsonBytes, err := json.Marshal(cfg)
+	if err != nil {
+		return option.Options{}, fmt.Errorf("marshal config: %w", err)
+	}
 
-    // Парсим в option.Options с контекстом sing-box, чтобы сработали регистры (outbound options registry и т.д.)
-    var opts option.Options
-    ctx := box.Context(context.Background(), include.InboundRegistry(), include.OutboundRegistry(), include.EndpointRegistry())
-    if err := opts.UnmarshalJSONContext(ctx, jsonBytes); err != nil {
-        return option.Options{}, fmt.Errorf("unmarshal to options: %w", err)
-    }
-    return opts, nil
+	var opts option.Options
+	ctx := box.Context(context.Background(), include.InboundRegistry(), include.OutboundRegistry(), include.EndpointRegistry())
+	if err := opts.UnmarshalJSONContext(ctx, jsonBytes); err != nil {
+		return option.Options{}, fmt.Errorf("unmarshal to options: %w", err)
+	}
+	return opts, nil
 }
 
-// buildOutboundMap возвращает map с полями outbound в зависимости от типа
-func buildOutboundMap(s ServerEntry) map[string]interface{} {
-    out := map[string]interface{}{
-        "type":    s.Type,
-        "tag":     s.Name,
-        "server":  s.Server,
-    }
+func buildOutboundMap(s ServerEntry) (map[string]interface{}, error) {
+	host, port := parseHostPort(s.Server)
+	if host == "" {
+		return nil, fmt.Errorf("server address is empty")
+	}
 
-    switch s.Type {
-    case "hysteria2":
-        // Hysteria2 требует пароль, TLS конфигурацию и bandwidth параметры
-        host, port := parseHostPort(s.Server)
-        out["server"] = host
-        if port > 0 {
-            out["server_port"] = port
-        }
-        // Не указываем network — по умолчанию поддерживаются TCP и UDP
-        password := s.Username
-        if s.Password != "" {
-            password = s.Password
-        }
-        out["password"] = password
-        out["up_mbps"] = 50
-        out["down_mbps"] = 50
-        out["tls"] = map[string]interface{}{
-            "enabled":     true,
-            "server_name": host,
-            "insecure":    true,
-        }
-    default:
-        // fallback на direct
-        out["type"] = "direct"
-    }
-    return out
+	out := map[string]interface{}{
+		"type":        s.Type,
+		"tag":         s.Name,
+		"server":      host,
+		"server_port": port,
+	}
+
+	tlsServerName := s.TLS.ServerName
+	if tlsServerName == "" {
+		tlsServerName = host
+	}
+
+	switch s.Type {
+	case "hysteria2":
+		if s.Password == "" {
+			return nil, fmt.Errorf("hysteria2 requires password")
+		}
+		out["password"] = s.Password
+		out["up_mbps"] = orDefault(s.UpMbps, 50)
+		out["down_mbps"] = orDefault(s.DownMbps, 50)
+		out["tls"] = map[string]interface{}{
+			"enabled":     true,
+			"server_name": tlsServerName,
+			"insecure":    s.TLS.Insecure,
+		}
+
+	case "vless":
+		if s.UUID == "" {
+			return nil, fmt.Errorf("vless requires uuid")
+		}
+		out["uuid"] = s.UUID
+		if s.Flow != "" {
+			out["flow"] = s.Flow
+		}
+		if s.Reality.PublicKey != "" {
+			// VLESS + Reality
+			realityServerName := s.Reality.ServerName
+			if realityServerName == "" {
+				realityServerName = tlsServerName
+			}
+			fingerprint := s.Reality.Fingerprint
+			if fingerprint == "" {
+				fingerprint = "chrome"
+			}
+			out["tls"] = map[string]interface{}{
+				"enabled":     true,
+				"server_name": realityServerName,
+				"utls": map[string]interface{}{
+					"enabled":     true,
+					"fingerprint": fingerprint,
+				},
+				"reality": map[string]interface{}{
+					"enabled":    true,
+					"public_key": s.Reality.PublicKey,
+					"short_id":   s.Reality.ShortID,
+				},
+			}
+		} else if s.TLS.Enabled {
+			out["tls"] = map[string]interface{}{
+				"enabled":     true,
+				"server_name": tlsServerName,
+				"insecure":    s.TLS.Insecure,
+			}
+		}
+		if s.Network != "" {
+			out["transport"] = buildTransport(s)
+		}
+
+	case "vmess":
+		if s.UUID == "" {
+			return nil, fmt.Errorf("vmess requires uuid")
+		}
+		out["uuid"] = s.UUID
+		out["alter_id"] = s.AlterID
+		out["security"] = "auto"
+		if s.TLS.Enabled {
+			out["tls"] = map[string]interface{}{
+				"enabled":     true,
+				"server_name": tlsServerName,
+				"insecure":    s.TLS.Insecure,
+			}
+		}
+		if s.Network != "" {
+			out["transport"] = buildTransport(s)
+		}
+
+	case "trojan":
+		if s.Password == "" {
+			return nil, fmt.Errorf("trojan requires password")
+		}
+		out["password"] = s.Password
+		out["tls"] = map[string]interface{}{
+			"enabled":     true,
+			"server_name": tlsServerName,
+			"insecure":    s.TLS.Insecure,
+		}
+		if s.Network != "" {
+			out["transport"] = buildTransport(s)
+		}
+
+	case "shadowsocks":
+		if s.Password == "" {
+			return nil, fmt.Errorf("shadowsocks requires password")
+		}
+		method := s.Method
+		if method == "" {
+			method = "aes-128-gcm"
+		}
+		out["method"] = method
+		out["password"] = s.Password
+
+	default:
+		return nil, fmt.Errorf("unsupported protocol: %q", s.Type)
+	}
+
+	return out, nil
 }
 
-// extractServerName извлекает хост из строки "host:port"
-func extractServerName(server string) string {
-    host, _ := parseHostPort(server)
-    return host
+func buildTransport(s ServerEntry) map[string]interface{} {
+	switch s.Network {
+	case "ws":
+		t := map[string]interface{}{"type": "ws"}
+		if s.Path != "" {
+			t["path"] = s.Path
+		}
+		if s.Host != "" {
+			t["headers"] = map[string]interface{}{"Host": s.Host}
+		}
+		return t
+	case "grpc":
+		t := map[string]interface{}{"type": "grpc"}
+		if s.Path != "" {
+			t["service_name"] = s.Path
+		}
+		return t
+	case "h2":
+		t := map[string]interface{}{"type": "http"}
+		if s.Path != "" {
+			t["path"] = s.Path
+		}
+		if s.Host != "" {
+			t["host"] = []string{s.Host}
+		}
+		return t
+	default:
+		return map[string]interface{}{"type": s.Network}
+	}
 }
 
-// parseHostPort возвращает host и порт (0 если не указан)
 func parseHostPort(server string) (string, int) {
-    if idx := strings.LastIndex(server, ":"); idx != -1 {
-        host := server[:idx]
-        portStr := server[idx+1:]
-        if p, err := strconv.Atoi(portStr); err == nil {
-            return host, p
-        }
-    }
-    return server, 0
+	if idx := strings.LastIndex(server, ":"); idx != -1 {
+		host := server[:idx]
+		if p, err := strconv.Atoi(server[idx+1:]); err == nil {
+			return host, p
+		}
+	}
+	return server, 0
+}
+
+func orDefault(v, def int) int {
+	if v == 0 {
+		return def
+	}
+	return v
 }

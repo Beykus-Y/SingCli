@@ -2,14 +2,31 @@ package sysproxy
 
 import (
 	"fmt"
+	"os/exec"
 
 	"golang.org/x/sys/windows/registry"
 )
 
 const internetSettingsKey = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
 
-// Enable выставляет системный прокси Windows на указанный адрес (например "127.0.0.1:1080")
 func Enable(addr string) error {
+	if err := setRegistry(addr); err != nil {
+		return err
+	}
+	// WinHTTP используется Chrome/Edge — без него браузер игнорирует прокси
+	setWinHTTP(addr)
+	return nil
+}
+
+func Disable() error {
+	if err := clearRegistry(); err != nil {
+		return err
+	}
+	resetWinHTTP()
+	return nil
+}
+
+func setRegistry(addr string) error {
 	k, err := registry.OpenKey(registry.CURRENT_USER, internetSettingsKey, registry.SET_VALUE)
 	if err != nil {
 		return fmt.Errorf("open registry key: %w", err)
@@ -25,8 +42,7 @@ func Enable(addr string) error {
 	return nil
 }
 
-// Disable снимает системный прокси Windows
-func Disable() error {
+func clearRegistry() error {
 	k, err := registry.OpenKey(registry.CURRENT_USER, internetSettingsKey, registry.SET_VALUE)
 	if err != nil {
 		return fmt.Errorf("open registry key: %w", err)
@@ -37,4 +53,12 @@ func Disable() error {
 		return fmt.Errorf("set ProxyEnable: %w", err)
 	}
 	return nil
+}
+
+func setWinHTTP(addr string) {
+	exec.Command("netsh", "winhttp", "set", "proxy", addr).Run()
+}
+
+func resetWinHTTP() {
+	exec.Command("netsh", "winhttp", "reset", "proxy").Run()
 }
