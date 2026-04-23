@@ -1,0 +1,17 @@
+Generated config: {"inbounds":[{"listen":"127.0.0.1","listen_port":1080,"tag":"socks-in","type":"socks"}],"outbounds":[{"down_mbps":100,"password":"estonia","server":"mgboosthy2.duckdns.org","server_port":8443,"tag":"Estonia - Hysteria2","tls":{"enabled":true,"insecure":false,"server_name":"mgboosthy2.duckdns.org"},"type":"hysteria2","up_mbps":100}]}
+2026/04/23 22:35:03 SingCli is running, press Ctrl+C to stop
+Parsed option.Options: {
+  "inbounds": [
+    {
+      "type": "socks",
+      "tag": "socks-in"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "hysteria2",
+      "tag": "Estonia - Hysteria2"
+    }
+  ]
+}
+2026/04/23 22:35:03 create box: initialize outbound[0]: TLS required
