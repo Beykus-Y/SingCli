@@ -4,3 +4,5 @@ parsed.json
 conf.json
 .gocache/
 .gomodcache/
+bin/singcli.log
+.codex

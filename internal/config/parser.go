@@ -36,8 +36,12 @@ type ServerEntry struct {
 	Server   string        `json:"server"`
 	UUID     string        `json:"uuid"`
 	Password string        `json:"password"`
+	Username string        `json:"username"`
 	TLS      TLSConfig     `json:"tls"`
 	Reality  RealityConfig `json:"reality"`
+	Insecure bool          `json:"insecure"`
+	// allowInsecure is used by some imported Hysteria2 configs.
+	AllowInsecure bool `json:"allowInsecure"`
 
 	// Hysteria2
 	UpMbps   int `json:"upMbps"`
@@ -71,11 +75,23 @@ func LoadServers(configPath string) ([]ServerEntry, error) {
 }
 
 func LoadServersFromBytes(data []byte) ([]ServerEntry, error) {
-	var cfg ServersConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parse servers config: %w", err)
+	trimmed := strings.TrimSpace(string(data))
+	if strings.HasPrefix(trimmed, "{") {
+		var cfg ServersConfig
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			return nil, fmt.Errorf("parse servers config: %w", err)
+		}
+		for i := range cfg.Servers {
+			normalizeServer(&cfg.Servers[i])
+		}
+		return cfg.Servers, nil
 	}
-	return cfg.Servers, nil
+
+	servers := ParseURIList(trimmed)
+	if len(servers) == 0 {
+		return nil, fmt.Errorf("no valid server entries found")
+	}
+	return servers, nil
 }
 
 func SaveServers(configPath string, servers []ServerEntry) error {
@@ -103,6 +119,17 @@ func DefaultServersPath() (string, error) {
 	return filepath.Join(configDir, "MGB", "servers.json"), nil
 }
 
+func normalizeServer(s *ServerEntry) {
+	if s.Type == "hysteria2" {
+		if s.Password == "" && s.Username != "" {
+			s.Password = s.Username
+		}
+		if s.Insecure || s.AllowInsecure {
+			s.TLS.Insecure = true
+		}
+	}
+}
+
 func LoadServerByName(configPath string, serverName string) (option.Options, error) {
 	servers, err := LoadServers(configPath)
 	if err != nil {
@@ -125,9 +152,79 @@ func BuildTunOptionsForServer(s ServerEntry) (option.Options, error) {
 }
 
 func buildTunOptions(s ServerEntry) (option.Options, error) {
-	outbound, err := buildOutboundMap(s)
+	cfg, err := buildConfigMap(s, true)
 	if err != nil {
 		return option.Options{}, err
+	}
+	return unmarshalOptions(cfg, "tun config")
+}
+
+func buildOptions(s ServerEntry) (option.Options, error) {
+	cfg, err := buildConfigMap(s, false)
+	if err != nil {
+		return option.Options{}, err
+	}
+	return unmarshalOptions(cfg, "config")
+}
+
+func BuildConfigJSONForServer(s ServerEntry, tunMode bool, redact bool) ([]byte, error) {
+	cfg, err := buildConfigMap(s, tunMode)
+	if err != nil {
+		return nil, err
+	}
+	if redact {
+		cfg = redactConfigMap(cfg)
+	}
+	return json.MarshalIndent(cfg, "", "  ")
+}
+
+func buildConfigMap(s ServerEntry, tunMode bool) (map[string]interface{}, error) {
+	normalizeServer(&s)
+	outbound, err := buildOutboundMap(s)
+	if err != nil {
+		return nil, err
+	}
+
+	if !tunMode {
+		return map[string]interface{}{
+			"log": map[string]interface{}{
+				"level": "info",
+			},
+			"dns": map[string]interface{}{
+				"servers": []interface{}{
+					map[string]interface{}{"address": "1.1.1.1", "detour": "direct"},
+					map[string]interface{}{"address": "8.8.8.8", "detour": "direct"},
+				},
+			},
+			"inbounds": []interface{}{
+				map[string]interface{}{
+					"type":        "socks",
+					"tag":         "socks-in",
+					"listen":      "127.0.0.1",
+					"listen_port": 1080,
+				},
+				map[string]interface{}{
+					"type":        "http",
+					"tag":         "http-in",
+					"listen":      "127.0.0.1",
+					"listen_port": 1081,
+				},
+			},
+			"outbounds": []interface{}{
+				outbound,
+				map[string]interface{}{"type": "direct", "tag": "direct"},
+				map[string]interface{}{"type": "block", "tag": "block"},
+			},
+			"route": map[string]interface{}{
+				"rules": []interface{}{
+					map[string]interface{}{
+						"port":     53,
+						"network":  "udp",
+						"outbound": "direct",
+					},
+				},
+			},
+		}, nil
 	}
 
 	routeRules := []interface{}{
@@ -143,13 +240,17 @@ func buildTunOptions(s ServerEntry) (option.Options, error) {
 			"outbound": "dns-out",
 		},
 		// 2. Блокируем QUIC (UDP 443), чтобы браузеры шли через TCP
+		map[string]interface{}{
+			"port":     []int{443},
+			"network":  []string{"udp"},
+			"outbound": "block",
+		},
 		// 3. Локальный трафик не трогаем
 		map[string]interface{}{
 			"ip_is_private": true,
 			"outbound":      "direct",
 		},
 	}
-	routeExcludeAddress := serverRouteExcludeAddresses(s)
 
 	cfg := map[string]interface{}{
 		"log": map[string]interface{}{
@@ -158,10 +259,11 @@ func buildTunOptions(s ServerEntry) (option.Options, error) {
 		"dns": map[string]interface{}{
 			"servers": []interface{}{
 				map[string]interface{}{
-					"tag": "dns-remote",
-					// Используем DNS-over-HTTPS: он на 100% стабильно работает через любой VLESS
-					"address": "https://1.1.1.1/dns-query",
-					"detour":  s.Name, // Жестко направляем в туннель
+					"tag":              "dns-remote",
+					"address":          "https://1.1.1.1/dns-query",
+					"detour":           s.Name, // Жестко направляем в туннель
+					"address_resolver": "dns-direct",
+					"address_strategy": "ipv4_only",
 				},
 				map[string]interface{}{
 					"tag":     "dns-direct",
@@ -184,13 +286,13 @@ func buildTunOptions(s ServerEntry) (option.Options, error) {
 				"type":                       "tun",
 				"tag":                        "tun-in",
 				"inet4_address":              "172.19.0.1/30",
-				"mtu":                        1400,
+				"mtu":                        tunMTU(s),
 				"auto_route":                 true,
 				"strict_route":               true,    // ВАЖНО: включает WFP на Windows для обхода петель
 				"stack":                      "mixed", // ВАЖНО: включает gVisor для безупречной работы TCP
 				"sniff":                      true,
 				"sniff_override_destination": false,
-				"route_exclude_address":      routeExcludeAddress,
+				"route_exclude_address":      serverRouteExcludeAddresses(s),
 			},
 		},
 		"outbounds": []interface{}{
@@ -206,76 +308,60 @@ func buildTunOptions(s ServerEntry) (option.Options, error) {
 		},
 	}
 
+	return cfg, nil
+}
+
+func unmarshalOptions(cfg map[string]interface{}, label string) (option.Options, error) {
 	jsonBytes, err := json.Marshal(cfg)
 	if err != nil {
-		return option.Options{}, fmt.Errorf("marshal tun config: %w", err)
+		return option.Options{}, fmt.Errorf("marshal %s: %w", label, err)
 	}
-
 	var opts option.Options
 	ctx := box.Context(context.Background(), include.InboundRegistry(), include.OutboundRegistry(), include.EndpointRegistry())
 	if err := opts.UnmarshalJSONContext(ctx, jsonBytes); err != nil {
-		return option.Options{}, fmt.Errorf("unmarshal tun options: %w", err)
+		return option.Options{}, fmt.Errorf("unmarshal %s options: %w", label, err)
 	}
 	return opts, nil
 }
 
-func buildOptions(s ServerEntry) (option.Options, error) {
-	outbound, err := buildOutboundMap(s)
+func tunMTU(s ServerEntry) int {
+	if s.Type == "hysteria2" {
+		return 1400
+	}
+	return 1500
+}
+
+func redactConfigMap(cfg map[string]interface{}) map[string]interface{} {
+	bytes, err := json.Marshal(cfg)
 	if err != nil {
-		return option.Options{}, err
+		return cfg
 	}
-
-	cfg := map[string]interface{}{
-		"log": map[string]interface{}{
-			"level": "info",
-		},
-		"dns": map[string]interface{}{
-			"servers": []interface{}{
-				map[string]interface{}{"address": "1.1.1.1", "detour": "direct"},
-				map[string]interface{}{"address": "8.8.8.8", "detour": "direct"},
-			},
-		},
-		"inbounds": []interface{}{
-			map[string]interface{}{
-				"type":        "socks",
-				"tag":         "socks-in",
-				"listen":      "127.0.0.1",
-				"listen_port": 1080,
-			},
-			map[string]interface{}{
-				"type":        "http",
-				"tag":         "http-in",
-				"listen":      "127.0.0.1",
-				"listen_port": 1081,
-			},
-		},
-		"outbounds": []interface{}{
-			outbound,
-			map[string]interface{}{"type": "direct", "tag": "direct"},
-			map[string]interface{}{"type": "block", "tag": "block"},
-		},
-		"route": map[string]interface{}{
-			"rules": []interface{}{
-				map[string]interface{}{
-					"port":     53,
-					"network":  "udp",
-					"outbound": "direct",
-				},
-			},
-		},
+	var cloned map[string]interface{}
+	if err := json.Unmarshal(bytes, &cloned); err != nil {
+		return cfg
 	}
-
-	jsonBytes, err := json.Marshal(cfg)
-	if err != nil {
-		return option.Options{}, fmt.Errorf("marshal config: %w", err)
+	outbounds, _ := cloned["outbounds"].([]interface{})
+	for _, outbound := range outbounds {
+		out, ok := outbound.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		for _, key := range []string{"password", "uuid"} {
+			if _, exists := out[key]; exists {
+				out[key] = "<redacted>"
+			}
+		}
+		if tls, ok := out["tls"].(map[string]interface{}); ok {
+			if reality, ok := tls["reality"].(map[string]interface{}); ok {
+				for _, key := range []string{"public_key", "short_id"} {
+					if _, exists := reality[key]; exists {
+						reality[key] = "<redacted>"
+					}
+				}
+			}
+		}
 	}
-
-	var opts option.Options
-	ctx := box.Context(context.Background(), include.InboundRegistry(), include.OutboundRegistry(), include.EndpointRegistry())
-	if err := opts.UnmarshalJSONContext(ctx, jsonBytes); err != nil {
-		return option.Options{}, fmt.Errorf("unmarshal to options: %w", err)
-	}
-	return opts, nil
+	return cloned
 }
 
 func serverRouteExcludeAddresses(s ServerEntry) []string {
@@ -347,6 +433,7 @@ func buildOutboundMap(s ServerEntry) (map[string]interface{}, error) {
 			"server_name": tlsServerName,
 			"insecure":    s.TLS.Insecure,
 		}
+		out["domain_strategy"] = "ipv4_only"
 
 	case "vless":
 		if s.UUID == "" {
@@ -467,6 +554,12 @@ func buildTransport(s ServerEntry) map[string]interface{} {
 		}
 		if s.Host != "" {
 			t["host"] = []string{s.Host}
+		}
+		return t
+	case "xhttp":
+		t := map[string]interface{}{"type": "xhttp"}
+		if s.Path != "" {
+			t["path"] = s.Path
 		}
 		return t
 	default:
