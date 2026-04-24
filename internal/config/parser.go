@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -69,7 +71,10 @@ func LoadServers(configPath string) ([]ServerEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read servers config: %w", err)
 	}
+	return LoadServersFromBytes(data)
+}
 
+func LoadServersFromBytes(data []byte) ([]ServerEntry, error) {
 	trimmed := strings.TrimSpace(string(data))
 	if strings.HasPrefix(trimmed, "{") {
 		var cfg ServersConfig
@@ -84,9 +89,34 @@ func LoadServers(configPath string) ([]ServerEntry, error) {
 
 	servers := ParseURIList(trimmed)
 	if len(servers) == 0 {
-		return nil, fmt.Errorf("no valid server entries found in %q", configPath)
+		return nil, fmt.Errorf("no valid server entries found")
 	}
 	return servers, nil
+}
+
+func SaveServers(configPath string, servers []ServerEntry) error {
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		return fmt.Errorf("create servers config directory: %w", err)
+	}
+
+	data, err := json.MarshalIndent(ServersConfig{Servers: servers}, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal servers config: %w", err)
+	}
+	data = append(data, '\n')
+
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+		return fmt.Errorf("write servers config: %w", err)
+	}
+	return nil
+}
+
+func DefaultServersPath() (string, error) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("get user config dir: %w", err)
+	}
+	return filepath.Join(configDir, "MGB", "servers.json"), nil
 }
 
 func normalizeServer(s *ServerEntry) {
@@ -246,6 +276,7 @@ func buildConfigMap(s ServerEntry, tunMode bool) (map[string]interface{}, error)
 				"stack":                      "mixed", // ВАЖНО: включает gVisor для безупречной работы TCP
 				"sniff":                      true,
 				"sniff_override_destination": false,
+				"route_exclude_address":      serverRouteExcludeAddresses(s),
 			},
 		},
 		"outbounds": []interface{}{
@@ -344,6 +375,44 @@ func redactConfigMap(cfg map[string]interface{}) map[string]interface{} {
 		}
 	}
 	return cloned
+}
+
+func serverRouteExcludeAddresses(s ServerEntry) []string {
+	host, _ := parseHostPort(s.Server)
+	if host == "" {
+		return nil
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return []string{prefixForAddr(addr)}
+	}
+
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return nil
+	}
+	excludes := make([]string, 0, len(ips))
+	seen := make(map[string]bool, len(ips))
+	for _, ip := range ips {
+		addr, ok := netip.AddrFromSlice(ip)
+		if !ok {
+			continue
+		}
+		addr = addr.Unmap()
+		prefix := prefixForAddr(addr)
+		if seen[prefix] {
+			continue
+		}
+		seen[prefix] = true
+		excludes = append(excludes, prefix)
+	}
+	return excludes
+}
+
+func prefixForAddr(addr netip.Addr) string {
+	if addr.Is4() {
+		return addr.String() + "/32"
+	}
+	return addr.String() + "/128"
 }
 
 func buildOutboundMap(s ServerEntry) (map[string]interface{}, error) {

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "MGB VPN",
+  "outputfilename": "mgb-gui",
+  "build:dir": "../../build",
+  "frontend:dir": "frontend",
+  "wailsjsdir": "frontend",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "",
+    "email": ""
+  },
+  "info": {
+    "companyName": "MGB",
+    "productName": "MGB VPN",
+    "productVersion": "1.0.0",
+    "copyright": "Copyright MGB",
+    "comments": "MGB VPN desktop client"
+  }
+}

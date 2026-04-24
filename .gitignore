@@ -2,5 +2,7 @@ config.json
 servers.json
 parsed.json
 conf.json
+.gocache/
+.gomodcache/
 bin/singcli.log
 .codex
