@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
@@ -160,9 +161,7 @@ func (m *Manager) watchdogProxy() {
 	}
 }
 
-// watchdogTun проверяет живость core через TCP на 443 (не перехватывается dns-out правилом)
 func (m *Manager) watchdogTun() {
-	const checkTarget = "1.1.1.1:443"
 	attempts := 0
 
 	for {
@@ -170,9 +169,12 @@ func (m *Manager) watchdogTun() {
 		case <-m.ctx.Done():
 			return
 		case <-time.After(healthCheckInterval):
-			if isPortAlive(checkTarget) {
+			if err := tunHealthCheck(m.ctx); err == nil {
 				attempts = 0
 				continue
+			} else {
+				log.Printf("TUN health check failed: %v", err)
+				logger.Warnf("TUN health check failed: %v", err)
 			}
 
 			if attempts >= maxReconnects {
@@ -195,6 +197,35 @@ func (m *Manager) watchdogTun() {
 			}
 		}
 	}
+}
+
+func tunHealthCheck(parent context.Context) error {
+	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
+	defer cancel()
+
+	resolver := net.DefaultResolver
+	if _, err := resolver.LookupHost(ctx, "www.google.com"); err != nil {
+		return fmt.Errorf("dns lookup www.google.com: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.google.com/generate_204", nil)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{
+		Transport: &http.Transport{Proxy: nil},
+		Timeout:   8 * time.Second,
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("http probe: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		return fmt.Errorf("http probe status: %s", resp.Status)
+	}
+	return nil
 }
 
 func isPortAlive(addr string) bool {

@@ -2,7 +2,6 @@ package core
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -33,14 +32,19 @@ func NewCore(opts Options) *Core {
 }
 
 func (c *Core) Start() error {
-	f, err := os.Open(c.opts.ConfigPath)
+	data, err := os.ReadFile(c.opts.ConfigPath)
 	if err != nil {
-		return fmt.Errorf("open config: %w", err)
+		return fmt.Errorf("read config: %w", err)
 	}
-	defer f.Close()
 
 	var opt option.Options
-	if err := json.NewDecoder(f).Decode(&opt); err != nil {
+	ctx := box.Context(
+		context.Background(),
+		include.InboundRegistry(),
+		include.OutboundRegistry(),
+		include.EndpointRegistry(),
+	)
+	if err := opt.UnmarshalJSONContext(ctx, data); err != nil {
 		return fmt.Errorf("parse config: %w", err)
 	}
 	return c.startInstance(opt)
