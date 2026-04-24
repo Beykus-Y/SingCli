@@ -222,32 +222,16 @@ func buildConfigMap(s ServerEntry, tunMode bool) (map[string]interface{}, error)
 		},
 	}
 
+	dnsServers, dnsRules, dnsFinal := buildTunDNS(s)
+
 	cfg := map[string]interface{}{
 		"log": map[string]interface{}{
 			"level": "info",
 		},
 		"dns": map[string]interface{}{
-			"servers": []interface{}{
-				map[string]interface{}{
-					"tag":              "dns-remote",
-					"address":          "https://1.1.1.1/dns-query",
-					"detour":           s.Name, // Жестко направляем в туннель
-					"address_resolver": "dns-direct",
-					"address_strategy": "ipv4_only",
-				},
-				map[string]interface{}{
-					"tag":     "dns-direct",
-					"address": "local", // Системный DNS для самого sing-box
-					"detour":  "direct",
-				},
-			},
-			"rules": []interface{}{
-				map[string]interface{}{
-					"outbound": []string{"any"}, // DNS-запросы от самого VPN-клиента (поиск IP сервера)
-					"server":   "dns-direct",
-				},
-			},
-			"final":             "dns-remote",
+			"servers":           dnsServers,
+			"rules":             dnsRules,
+			"final":             dnsFinal,
 			"strategy":          "ipv4_only", // Запрещаем IPv6, чтобы избежать "черных дыр" в браузере
 			"independent_cache": true,
 		},
@@ -278,6 +262,35 @@ func buildConfigMap(s ServerEntry, tunMode bool) (map[string]interface{}, error)
 	}
 
 	return cfg, nil
+}
+
+func buildTunDNS(s ServerEntry) ([]interface{}, []interface{}, string) {
+	directDNS := map[string]interface{}{
+		"tag":      "dns-direct",
+		"address":  "tcp://1.1.1.1",
+		"detour":   "direct",
+		"strategy": "ipv4_only",
+	}
+
+	if s.Type == "hysteria2" {
+		return []interface{}{directDNS}, []interface{}{}, "dns-direct"
+	}
+
+	return []interface{}{
+			map[string]interface{}{
+				"tag":              "dns-remote",
+				"address":          "https://1.1.1.1/dns-query",
+				"detour":           s.Name,
+				"address_resolver": "dns-direct",
+				"address_strategy": "ipv4_only",
+			},
+			directDNS,
+		}, []interface{}{
+			map[string]interface{}{
+				"outbound": []string{"any"}, // DNS-запросы от самого VPN-клиента (поиск IP сервера)
+				"server":   "dns-direct",
+			},
+		}, "dns-remote"
 }
 
 func unmarshalOptions(cfg map[string]interface{}, label string) (option.Options, error) {

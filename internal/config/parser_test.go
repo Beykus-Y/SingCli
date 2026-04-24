@@ -38,6 +38,14 @@ func TestHysteria2PasswordAndTunProfile(t *testing.T) {
 	if got := inbound["mtu"]; got != float64(1400) {
 		t.Fatalf("tun mtu = %v, want 1400", got)
 	}
+	dns := cfg["dns"].(map[string]interface{})
+	if got := dns["final"]; got != "dns-direct" {
+		t.Fatalf("hysteria2 tun dns final = %v, want dns-direct", got)
+	}
+	dnsServer := dns["servers"].([]interface{})[0].(map[string]interface{})
+	if got := dnsServer["address"]; got != "tcp://1.1.1.1" {
+		t.Fatalf("hysteria2 tun dns address = %v, want tcp://1.1.1.1", got)
+	}
 }
 
 func TestLoadServersHysteria2LegacyAliases(t *testing.T) {
@@ -164,6 +172,10 @@ func TestVLESSRealityGRPCConfigUnchanged(t *testing.T) {
 	inbound := firstInbound(t, cfg)
 	if got := inbound["mtu"]; got != float64(1500) {
 		t.Fatalf("vless tun mtu = %v, want 1500", got)
+	}
+	dns := cfg["dns"].(map[string]interface{})
+	if got := dns["final"]; got != "dns-remote" {
+		t.Fatalf("vless tun dns final = %v, want dns-remote", got)
 	}
 }
 
