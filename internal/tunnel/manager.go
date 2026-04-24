@@ -20,7 +20,11 @@ const (
 	healthCheckInterval = 5 * time.Second
 	reconnectDelay      = 3 * time.Second
 	maxReconnects       = 5
+	tunTeardownDelay    = 1200 * time.Millisecond
+	tunStartRetries     = 3
 )
+
+var tunLifecycleMu sync.Mutex
 
 type Manager struct {
 	mu        sync.Mutex
@@ -80,6 +84,11 @@ func (m *Manager) Start(opts option.Options) error {
 func (m *Manager) Stop() {
 	m.cancel()
 
+	if m.tunMode {
+		tunLifecycleMu.Lock()
+		defer tunLifecycleMu.Unlock()
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -97,23 +106,60 @@ func (m *Manager) Stop() {
 		m.core.Close()
 		m.core = nil
 	}
+
+	if m.tunMode {
+		cleanupTun()
+		time.Sleep(tunTeardownDelay)
+	}
 }
 
 func (m *Manager) startCore() error {
+	if m.tunMode {
+		tunLifecycleMu.Lock()
+		defer tunLifecycleMu.Unlock()
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if m.core != nil {
 		m.core.Close()
 		m.core = nil
+		if m.tunMode {
+			cleanupTun()
+			time.Sleep(tunTeardownDelay)
+		}
 	}
 
-	c := core.NewCore(core.Options{})
-	if err := c.StartWithOptions(m.opts); err != nil {
-		return fmt.Errorf("start core: %w", err)
+	attempts := 1
+	if m.tunMode {
+		attempts = tunStartRetries
 	}
-	m.core = c
-	return nil
+
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if m.tunMode {
+			cleanupTun()
+		}
+
+		c := core.NewCore(core.Options{})
+		if err := c.StartWithOptions(m.opts); err != nil {
+			_ = c.Close()
+			lastErr = fmt.Errorf("start core: %w", err)
+			if m.tunMode && isTunAddressAlreadyExists(err) && attempt < attempts {
+				log.Printf("TUN address still exists, retrying startup (%d/%d)...", attempt+1, attempts)
+				logger.Warnf("TUN address still exists, retrying startup (%d/%d)", attempt+1, attempts)
+				cleanupTun()
+				time.Sleep(time.Duration(attempt) * tunTeardownDelay)
+				continue
+			}
+			return lastErr
+		}
+		m.core = c
+		return nil
+	}
+
+	return lastErr
 }
 
 func (m *Manager) watchdog() {

@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -10,6 +11,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"SingCli/internal/tunsettings"
 
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/include"
@@ -66,6 +69,8 @@ type ServersConfig struct {
 	Servers []ServerEntry `json:"servers"`
 }
 
+const ServersFilename = "servers.json"
+
 func LoadServers(configPath string) ([]ServerEntry, error) {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
@@ -75,10 +80,14 @@ func LoadServers(configPath string) ([]ServerEntry, error) {
 }
 
 func LoadServersFromBytes(data []byte) ([]ServerEntry, error) {
-	trimmed := strings.TrimSpace(string(data))
+	trimmed := strings.TrimSpace(strings.TrimPrefix(string(data), "\uFEFF"))
+	if trimmed == "" {
+		return nil, fmt.Errorf("no valid server entries found")
+	}
+
 	if strings.HasPrefix(trimmed, "{") {
 		var cfg ServersConfig
-		if err := json.Unmarshal(data, &cfg); err != nil {
+		if err := json.Unmarshal([]byte(trimmed), &cfg); err != nil {
 			return nil, fmt.Errorf("parse servers config: %w", err)
 		}
 		for i := range cfg.Servers {
@@ -89,9 +98,69 @@ func LoadServersFromBytes(data []byte) ([]ServerEntry, error) {
 
 	servers := ParseURIList(trimmed)
 	if len(servers) == 0 {
+		if decoded, ok := decodeBase64Subscription(trimmed); ok {
+			servers = ParseURIList(decoded)
+		}
+	}
+	if len(servers) == 0 {
 		return nil, fmt.Errorf("no valid server entries found")
 	}
 	return servers, nil
+}
+
+func decodeBase64Subscription(data string) (string, bool) {
+	compact := strings.NewReplacer("\r", "", "\n", "", "\t", "", " ", "").Replace(data)
+	if compact == "" {
+		return "", false
+	}
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding,
+		base64.URLEncoding,
+		base64.RawStdEncoding,
+		base64.RawURLEncoding,
+	} {
+		if decoded, err := enc.DecodeString(compact); err == nil {
+			text := strings.TrimSpace(strings.TrimPrefix(string(decoded), "\uFEFF"))
+			if text != "" {
+				return text, true
+			}
+		}
+	}
+	return "", false
+}
+
+func FindServersConfigCandidates() []string {
+	var rawPaths []string
+
+	if abs, err := filepath.Abs(ServersFilename); err == nil {
+		rawPaths = append(rawPaths, abs)
+	}
+
+	if exePath, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exePath)
+		rawPaths = append(rawPaths,
+			filepath.Join(exeDir, ServersFilename),
+			filepath.Join(filepath.Dir(exeDir), ServersFilename),
+		)
+	}
+
+	if defaultPath, err := DefaultServersPath(); err == nil {
+		rawPaths = append(rawPaths, defaultPath)
+	}
+
+	seen := make(map[string]bool, len(rawPaths))
+	result := make([]string, 0, len(rawPaths))
+	for _, path := range rawPaths {
+		cleanPath := filepath.Clean(path)
+		if seen[cleanPath] {
+			continue
+		}
+		seen[cleanPath] = true
+		if _, err := os.Stat(cleanPath); err == nil {
+			result = append(result, cleanPath)
+		}
+	}
+	return result
 }
 
 func SaveServers(configPath string, servers []ServerEntry) error {
@@ -116,7 +185,7 @@ func DefaultServersPath() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("get user config dir: %w", err)
 	}
-	return filepath.Join(configDir, "MGB", "servers.json"), nil
+	return filepath.Join(configDir, "MGB", ServersFilename), nil
 }
 
 func normalizeServer(s *ServerEntry) {
@@ -145,6 +214,39 @@ func LoadServerByName(configPath string, serverName string) (option.Options, err
 
 func BuildOptionsForServer(s ServerEntry) (option.Options, error) {
 	return buildOptions(s)
+}
+
+// BuildOptionsForSpeedTest builds a minimal proxy config that listens on httpPort.
+// It omits watchdog, sysproxy, and extra inbounds to keep startup fast.
+func BuildOptionsForSpeedTest(s ServerEntry, httpPort int) (option.Options, error) {
+	normalizeServer(&s)
+	outbound, err := buildOutboundMap(s)
+	if err != nil {
+		return option.Options{}, err
+	}
+	cfg := map[string]interface{}{
+		"log": map[string]interface{}{"level": "warn"},
+		"dns": map[string]interface{}{
+			"servers": []interface{}{
+				map[string]interface{}{"address": "1.1.1.1", "detour": "direct"},
+				map[string]interface{}{"address": "8.8.8.8", "detour": "direct"},
+			},
+		},
+		"inbounds": []interface{}{
+			map[string]interface{}{
+				"type":        "http",
+				"tag":         "http-test",
+				"listen":      "127.0.0.1",
+				"listen_port": httpPort,
+			},
+		},
+		"outbounds": []interface{}{
+			outbound,
+			map[string]interface{}{"type": "direct", "tag": "direct"},
+			map[string]interface{}{"type": "block", "tag": "block"},
+		},
+	}
+	return unmarshalOptions(cfg, "speed test config")
 }
 
 func BuildTunOptionsForServer(s ServerEntry) (option.Options, error) {
@@ -269,7 +371,8 @@ func buildConfigMap(s ServerEntry, tunMode bool) (map[string]interface{}, error)
 			map[string]interface{}{
 				"type":                       "tun",
 				"tag":                        "tun-in",
-				"inet4_address":              "172.19.0.1/30",
+				"interface_name":             tunsettings.InterfaceName,
+				"inet4_address":              tunsettings.IPv4Prefix,
 				"mtu":                        tunMTU(s),
 				"auto_route":                 true,
 				"strict_route":               true,    // ВАЖНО: включает WFP на Windows для обхода петель
@@ -570,9 +673,14 @@ func buildTransport(s ServerEntry) map[string]interface{} {
 		}
 		return t
 	case "xhttp":
-		t := map[string]interface{}{"type": "xhttp"}
+		// sing-box does not implement Xray SplitHTTP/XHTTP natively.
+		// Map imported XHTTP links to the closest supported V2Ray HTTP transport.
+		t := map[string]interface{}{"type": "http"}
 		if s.Path != "" {
 			t["path"] = s.Path
+		}
+		if s.Host != "" {
+			t["host"] = []string{s.Host}
 		}
 		return t
 	default:

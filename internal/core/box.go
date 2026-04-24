@@ -72,6 +72,8 @@ func (c *Core) startInstance(opt option.Options) error {
 	c.instance = instance
 
 	if err := instance.Start(); err != nil {
+		_ = instance.Close()
+		c.instance = nil
 		return fmt.Errorf("start box: %w", err)
 	}
 

@@ -31,7 +31,7 @@ func ParseURI(raw string) (ServerEntry, error) {
 func ParseURIList(data string) []ServerEntry {
 	var out []ServerEntry
 	for _, line := range strings.Split(data, "\n") {
-		line = strings.TrimSpace(line)
+		line = strings.TrimSpace(strings.TrimPrefix(line, "\uFEFF"))
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -103,9 +103,10 @@ func parseVLESS(raw string) (ServerEntry, error) {
 		s.Network = "ws"
 		s.Path = path
 		s.Host = hostHeader
-	case "xhttp":
+	case "xhttp", "splithttp":
 		s.Network = "xhttp"
 		s.Path = path
+		s.Host = hostHeader
 	}
 
 	return s, nil

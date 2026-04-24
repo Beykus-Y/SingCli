@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -49,6 +50,66 @@ func TestLoadServersFromBytesInvalidJSON(t *testing.T) {
 	_, err := LoadServersFromBytes([]byte(`{"servers":`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
+	}
+}
+
+func TestLoadServersFromBytesJSONWithBOM(t *testing.T) {
+	servers, err := LoadServersFromBytes([]byte("\uFEFF{\"servers\":[{\"name\":\"demo\",\"type\":\"shadowsocks\",\"server\":\"127.0.0.1:8388\",\"password\":\"secret\"}]}"))
+	if err != nil {
+		t.Fatalf("LoadServersFromBytes() error = %v", err)
+	}
+	if len(servers) != 1 {
+		t.Fatalf("len(servers) = %d, want 1", len(servers))
+	}
+}
+
+func TestLoadServersFromBytesURIList(t *testing.T) {
+	data := []byte(strings.Join([]string{
+		"vless://26aa11f0-35e5-4a51-94f6-60ac63c96a35@example.com:443?security=reality&type=grpc&serviceName=grpc-main&sni=www.microsoft.com&fp=chrome&pbk=public-key&sid=short-id#VLESS%20Reality",
+		"ss://YWVzLTEyOC1nY206c2VjcmV0@example.net:8388#SS",
+		"hysteria2://hy-secret@hy.example.org:8443?sni=hy.example.org&insecure=1#HY2",
+	}, "\n"))
+
+	servers, err := LoadServersFromBytes(data)
+	if err != nil {
+		t.Fatalf("LoadServersFromBytes() error = %v", err)
+	}
+	if len(servers) != 3 {
+		t.Fatalf("len(servers) = %d, want 3", len(servers))
+	}
+	if servers[0].Name != "VLESS Reality" || servers[0].Type != "vless" {
+		t.Fatalf("first server = %#v, want VLESS Reality vless", servers[0])
+	}
+	if servers[1].Method != "aes-128-gcm" || servers[1].Password != "secret" {
+		t.Fatalf("shadowsocks credentials = %q/%q, want aes-128-gcm/secret", servers[1].Method, servers[1].Password)
+	}
+	if !servers[2].TLS.Insecure {
+		t.Fatal("hysteria2 TLS.Insecure = false, want true")
+	}
+}
+
+func TestLoadServersFromBytesURIListWithBOM(t *testing.T) {
+	servers, err := LoadServersFromBytes([]byte("\uFEFFhysteria2://secret@example.com:443#hy2"))
+	if err != nil {
+		t.Fatalf("LoadServersFromBytes() error = %v", err)
+	}
+	if len(servers) != 1 {
+		t.Fatalf("len(servers) = %d, want 1", len(servers))
+	}
+	if servers[0].Type != "hysteria2" {
+		t.Fatalf("Type = %q, want hysteria2", servers[0].Type)
+	}
+}
+
+func TestLoadServersFromBytesBase64URIList(t *testing.T) {
+	payload := "hysteria2://secret@example.com:443#hy2\n"
+	encoded := base64.StdEncoding.EncodeToString([]byte(payload))
+	servers, err := LoadServersFromBytes([]byte(encoded))
+	if err != nil {
+		t.Fatalf("LoadServersFromBytes() error = %v", err)
+	}
+	if len(servers) != 1 || servers[0].Name != "hy2" {
+		t.Fatalf("servers = %#v, want one decoded hysteria2 server", servers)
 	}
 }
 
@@ -262,6 +323,28 @@ func TestVLESSRealityGRPCConfigUnchanged(t *testing.T) {
 	dns := cfg["dns"].(map[string]interface{})
 	if got := dns["final"]; got != "dns-remote" {
 		t.Fatalf("vless tun dns final = %v, want dns-remote", got)
+	}
+}
+
+func TestParseVLESSXHTTPURIUsesSupportedHTTPTransport(t *testing.T) {
+	server, err := ParseURI("vless://26aa11f0-35e5-4a51-94f6-60ac63c96a35@example.com:458?security=reality&type=xhttp&path=%2Fxhttp&host=front.example.com&sni=www.microsoft.com&fp=chrome&pbk=public-key&sid=short-id#xhttp")
+	if err != nil {
+		t.Fatalf("ParseURI() error = %v", err)
+	}
+	if server.Network != "xhttp" {
+		t.Fatalf("Network = %q, want xhttp", server.Network)
+	}
+	if _, err := BuildTunOptionsForServer(server); err != nil {
+		t.Fatalf("BuildTunOptionsForServer() error = %v", err)
+	}
+
+	cfg := mustConfigMap(t, server, true, false)
+	transport := firstOutbound(t, cfg)["transport"].(map[string]interface{})
+	if got := transport["type"]; got != "http" {
+		t.Fatalf("transport.type = %v, want http", got)
+	}
+	if got := transport["path"]; got != "/xhttp" {
+		t.Fatalf("transport.path = %v, want /xhttp", got)
 	}
 }
 
