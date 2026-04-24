@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -65,11 +67,40 @@ func LoadServers(configPath string) ([]ServerEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read servers config: %w", err)
 	}
+	return LoadServersFromBytes(data)
+}
+
+func LoadServersFromBytes(data []byte) ([]ServerEntry, error) {
 	var cfg ServersConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse servers config: %w", err)
 	}
 	return cfg.Servers, nil
+}
+
+func SaveServers(configPath string, servers []ServerEntry) error {
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		return fmt.Errorf("create servers config directory: %w", err)
+	}
+
+	data, err := json.MarshalIndent(ServersConfig{Servers: servers}, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal servers config: %w", err)
+	}
+	data = append(data, '\n')
+
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+		return fmt.Errorf("write servers config: %w", err)
+	}
+	return nil
+}
+
+func DefaultServersPath() (string, error) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("get user config dir: %w", err)
+	}
+	return filepath.Join(configDir, "MGB", "servers.json"), nil
 }
 
 func LoadServerByName(configPath string, serverName string) (option.Options, error) {
@@ -107,22 +138,18 @@ func buildTunOptions(s ServerEntry) (option.Options, error) {
 			"outbound": "dns-out",
 		},
 		map[string]interface{}{
-			"port":    []int{53},
-			"network": []string{"udp", "tcp"},
+			"port":     []int{53},
+			"network":  []string{"udp", "tcp"},
 			"outbound": "dns-out",
 		},
 		// 2. Блокируем QUIC (UDP 443), чтобы браузеры шли через TCP
-		map[string]interface{}{
-			"port":    []int{443},
-			"network": []string{"udp"},
-			"outbound": "block",
-		},
 		// 3. Локальный трафик не трогаем
 		map[string]interface{}{
 			"ip_is_private": true,
 			"outbound":      "direct",
 		},
 	}
+	routeExcludeAddress := serverRouteExcludeAddresses(s)
 
 	cfg := map[string]interface{}{
 		"log": map[string]interface{}{
@@ -131,9 +158,9 @@ func buildTunOptions(s ServerEntry) (option.Options, error) {
 		"dns": map[string]interface{}{
 			"servers": []interface{}{
 				map[string]interface{}{
-					"tag":     "dns-remote",
+					"tag": "dns-remote",
 					// Используем DNS-over-HTTPS: он на 100% стабильно работает через любой VLESS
-					"address": "https://1.1.1.1/dns-query", 
+					"address": "https://1.1.1.1/dns-query",
 					"detour":  s.Name, // Жестко направляем в туннель
 				},
 				map[string]interface{}{
@@ -142,9 +169,9 @@ func buildTunOptions(s ServerEntry) (option.Options, error) {
 					"detour":  "direct",
 				},
 			},
-			"rules":[]interface{}{
+			"rules": []interface{}{
 				map[string]interface{}{
-					"outbound":[]string{"any"}, // DNS-запросы от самого VPN-клиента (поиск IP сервера)
+					"outbound": []string{"any"}, // DNS-запросы от самого VPN-клиента (поиск IP сервера)
 					"server":   "dns-direct",
 				},
 			},
@@ -157,12 +184,13 @@ func buildTunOptions(s ServerEntry) (option.Options, error) {
 				"type":                       "tun",
 				"tag":                        "tun-in",
 				"inet4_address":              "172.19.0.1/30",
-				"mtu":                        1500,
+				"mtu":                        1400,
 				"auto_route":                 true,
-				"strict_route":               true, // ВАЖНО: включает WFP на Windows для обхода петель
+				"strict_route":               true,    // ВАЖНО: включает WFP на Windows для обхода петель
 				"stack":                      "mixed", // ВАЖНО: включает gVisor для безупречной работы TCP
 				"sniff":                      true,
 				"sniff_override_destination": false,
+				"route_exclude_address":      routeExcludeAddress,
 			},
 		},
 		"outbounds": []interface{}{
@@ -248,6 +276,44 @@ func buildOptions(s ServerEntry) (option.Options, error) {
 		return option.Options{}, fmt.Errorf("unmarshal to options: %w", err)
 	}
 	return opts, nil
+}
+
+func serverRouteExcludeAddresses(s ServerEntry) []string {
+	host, _ := parseHostPort(s.Server)
+	if host == "" {
+		return nil
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return []string{prefixForAddr(addr)}
+	}
+
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return nil
+	}
+	excludes := make([]string, 0, len(ips))
+	seen := make(map[string]bool, len(ips))
+	for _, ip := range ips {
+		addr, ok := netip.AddrFromSlice(ip)
+		if !ok {
+			continue
+		}
+		addr = addr.Unmap()
+		prefix := prefixForAddr(addr)
+		if seen[prefix] {
+			continue
+		}
+		seen[prefix] = true
+		excludes = append(excludes, prefix)
+	}
+	return excludes
+}
+
+func prefixForAddr(addr netip.Addr) string {
+	if addr.Is4() {
+		return addr.String() + "/32"
+	}
+	return addr.String() + "/128"
 }
 
 func buildOutboundMap(s ServerEntry) (map[string]interface{}, error) {

@@ -67,14 +67,14 @@ func main() {
 	// ----------------------------------------------------
 	if *testMode {
 		fmt.Printf("\n[Test] Testing connection to [%s] (%s)...\n", selected.Name, selected.Type)
-		
+
 		// 1. Собираем конфиг как для обычного прокси (без TUN)
 		opts, err := config.BuildOptionsForServer(selected)
 		if err != nil {
 			log.Fatalf("[Test] Failed to build config: %v", err)
 		}
 
-		// 2. Запускаем ядро НАПРЯМУЮ, минуя tunnel.Manager, 
+		// 2. Запускаем ядро НАПРЯМУЮ, минуя tunnel.Manager,
 		// чтобы sysproxy не изменял настройки Windows
 		c := core.NewCore(core.Options{})
 		if err := c.StartWithOptions(opts); err != nil {
@@ -97,7 +97,7 @@ func main() {
 		// 4. Делаем тестовый запрос
 		start := time.Now()
 		resp, err := client.Get("https://www.google.com")
-		
+
 		if err != nil {
 			fmt.Printf("❌ [Test] FAILED! Could not load page: %v\n", err)
 			os.Exit(1)
@@ -131,7 +131,8 @@ func main() {
 		logger.Infof("Connected (TUN) via [%s] (%s)", selected.Name, selected.Type)
 		fmt.Printf("\nConnected (TUN mode) via [%s] (%s)\n", selected.Name, selected.Type)
 		fmt.Println("All traffic routed through VPN")
-		fmt.Println("Press Ctrl+C to disconnect\n")
+		fmt.Println("Press Ctrl+C to disconnect")
+		fmt.Println()
 	} else {
 		o, err := config.BuildOptionsForServer(selected)
 		if err != nil {
@@ -147,7 +148,8 @@ func main() {
 		fmt.Printf("\nConnected via [%s] (%s)\n", selected.Name, selected.Type)
 		fmt.Println("SOCKS5 proxy: 127.0.0.1:1080")
 		fmt.Println("HTTP  proxy: 127.0.0.1:1081")
-		fmt.Println("Press Ctrl+C to disconnect\n")
+		fmt.Println("Press Ctrl+C to disconnect")
+		fmt.Println()
 	}
 
 	sigCh := make(chan os.Signal, 1)
@@ -159,7 +161,7 @@ func main() {
 	mgr.Stop()
 }
 
-func promptSelect(servers[]config.ServerEntry) config.ServerEntry {
+func promptSelect(servers []config.ServerEntry) config.ServerEntry {
 	fmt.Println("Available servers:")
 	for i, s := range servers {
 		fmt.Printf("  [%d] %s (%s)\n", i+1, s.Name, s.Type)
