@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -86,6 +87,108 @@ func LoadServerByName(configPath string, serverName string) (option.Options, err
 
 func BuildOptionsForServer(s ServerEntry) (option.Options, error) {
 	return buildOptions(s)
+}
+
+func BuildTunOptionsForServer(s ServerEntry) (option.Options, error) {
+	return buildTunOptions(s)
+}
+
+func buildTunOptions(s ServerEntry) (option.Options, error) {
+	outbound, err := buildOutboundMap(s)
+	if err != nil {
+		return option.Options{}, err
+	}
+
+	routeRules := []interface{}{
+		// 1. DNS перехватываем первым — до проверки private IP,
+		// иначе запросы к 172.19.0.2:53 (TUN-шлюз) уходят direct и теряются
+		map[string]interface{}{
+			"protocol": "dns",
+			"outbound": "dns-out",
+		},
+		map[string]interface{}{
+			"port":    []int{53},
+			"network": []string{"udp", "tcp"},
+			"outbound": "dns-out",
+		},
+		// 2. Блокируем QUIC (UDP 443), чтобы браузеры шли через TCP
+		map[string]interface{}{
+			"port":    []int{443},
+			"network": []string{"udp"},
+			"outbound": "block",
+		},
+		// 3. Локальный трафик не трогаем
+		map[string]interface{}{
+			"ip_is_private": true,
+			"outbound":      "direct",
+		},
+	}
+
+	cfg := map[string]interface{}{
+		"log": map[string]interface{}{
+			"level": "info",
+		},
+		"dns": map[string]interface{}{
+			"servers": []interface{}{
+				map[string]interface{}{
+					"tag":     "dns-remote",
+					// Используем DNS-over-HTTPS: он на 100% стабильно работает через любой VLESS
+					"address": "https://1.1.1.1/dns-query", 
+					"detour":  s.Name, // Жестко направляем в туннель
+				},
+				map[string]interface{}{
+					"tag":     "dns-direct",
+					"address": "local", // Системный DNS для самого sing-box
+					"detour":  "direct",
+				},
+			},
+			"rules":[]interface{}{
+				map[string]interface{}{
+					"outbound":[]string{"any"}, // DNS-запросы от самого VPN-клиента (поиск IP сервера)
+					"server":   "dns-direct",
+				},
+			},
+			"final":             "dns-remote",
+			"strategy":          "ipv4_only", // Запрещаем IPv6, чтобы избежать "черных дыр" в браузере
+			"independent_cache": true,
+		},
+		"inbounds": []interface{}{
+			map[string]interface{}{
+				"type":                       "tun",
+				"tag":                        "tun-in",
+				"inet4_address":              "172.19.0.1/30",
+				"mtu":                        1500,
+				"auto_route":                 true,
+				"strict_route":               true, // ВАЖНО: включает WFP на Windows для обхода петель
+				"stack":                      "mixed", // ВАЖНО: включает gVisor для безупречной работы TCP
+				"sniff":                      true,
+				"sniff_override_destination": false,
+			},
+		},
+		"outbounds": []interface{}{
+			outbound,
+			map[string]interface{}{"type": "direct", "tag": "direct"},
+			map[string]interface{}{"type": "block", "tag": "block"},
+			map[string]interface{}{"type": "dns", "tag": "dns-out"},
+		},
+		"route": map[string]interface{}{
+			"rules":                 routeRules,
+			"final":                 s.Name,
+			"auto_detect_interface": true,
+		},
+	}
+
+	jsonBytes, err := json.Marshal(cfg)
+	if err != nil {
+		return option.Options{}, fmt.Errorf("marshal tun config: %w", err)
+	}
+
+	var opts option.Options
+	ctx := box.Context(context.Background(), include.InboundRegistry(), include.OutboundRegistry(), include.EndpointRegistry())
+	if err := opts.UnmarshalJSONContext(ctx, jsonBytes); err != nil {
+		return option.Options{}, fmt.Errorf("unmarshal tun options: %w", err)
+	}
+	return opts, nil
 }
 
 func buildOptions(s ServerEntry) (option.Options, error) {
@@ -184,6 +287,9 @@ func buildOutboundMap(s ServerEntry) (map[string]interface{}, error) {
 			return nil, fmt.Errorf("vless requires uuid")
 		}
 		out["uuid"] = s.UUID
+		if s.Flow == "" {
+			out["packet_encoding"] = "xudp"
+		}
 		if s.Flow != "" {
 			out["flow"] = s.Flow
 		}
@@ -317,4 +423,9 @@ func orDefault(v, def int) int {
 		return def
 	}
 	return v
+}
+
+func isIPAddress(host string) bool {
+	_, err := netip.ParseAddr(host)
+	return err == nil
 }

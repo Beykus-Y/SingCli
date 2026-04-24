@@ -26,6 +26,7 @@ type Manager struct {
 	core      *core.Core
 	opts      option.Options
 	proxyAddr string
+	tunMode   bool
 	ctx       context.Context
 	cancel    context.CancelFunc
 }
@@ -39,19 +40,36 @@ func New(proxyAddr string) *Manager {
 	}
 }
 
+func NewTun() *Manager {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Manager{
+		tunMode: true,
+		ctx:     ctx,
+		cancel:  cancel,
+	}
+}
+
 func (m *Manager) Start(opts option.Options) error {
 	m.opts = opts
+
+	if m.tunMode {
+		if err := sysproxy.Disable(); err != nil {
+			log.Printf("Warning: failed to clear system proxy before TUN start: %v", err)
+		}
+	}
 
 	if err := m.startCore(); err != nil {
 		return err
 	}
 
-	if err := sysproxy.Enable(m.proxyAddr); err != nil {
-		log.Printf("Warning: failed to set system proxy: %v", err)
-		logger.Warnf("Failed to set system proxy: %v", err)
-	} else {
-		log.Printf("System proxy set to %s", m.proxyAddr)
-		logger.Infof("System proxy set to %s", m.proxyAddr)
+	if !m.tunMode {
+		if err := sysproxy.Enable(m.proxyAddr); err != nil {
+			log.Printf("Warning: failed to set system proxy: %v", err)
+			logger.Warnf("Failed to set system proxy: %v", err)
+		} else {
+			log.Printf("System proxy set to %s", m.proxyAddr)
+			logger.Infof("System proxy set to %s", m.proxyAddr)
+		}
 	}
 
 	go m.watchdog()
@@ -64,12 +82,14 @@ func (m *Manager) Stop() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if err := sysproxy.Disable(); err != nil {
-		log.Printf("Warning: failed to disable system proxy: %v", err)
-		logger.Warnf("Failed to disable system proxy: %v", err)
-	} else {
-		log.Println("System proxy disabled")
-		logger.Info("System proxy disabled")
+	if !m.tunMode {
+		if err := sysproxy.Disable(); err != nil {
+			log.Printf("Warning: failed to disable system proxy: %v", err)
+			logger.Warnf("Failed to disable system proxy: %v", err)
+		} else {
+			log.Println("System proxy disabled")
+			logger.Info("System proxy disabled")
+		}
 	}
 
 	if m.core != nil {
@@ -95,8 +115,15 @@ func (m *Manager) startCore() error {
 	return nil
 }
 
-// watchdog периодически проверяет что SOCKS порт отвечает и перезапускает core если нет
 func (m *Manager) watchdog() {
+	if m.tunMode {
+		m.watchdogTun()
+	} else {
+		m.watchdogProxy()
+	}
+}
+
+func (m *Manager) watchdogProxy() {
 	socksAddr := "127.0.0.1:1080"
 	attempts := 0
 
@@ -133,8 +160,45 @@ func (m *Manager) watchdog() {
 	}
 }
 
+// watchdogTun проверяет живость core через TCP на 443 (не перехватывается dns-out правилом)
+func (m *Manager) watchdogTun() {
+	const checkTarget = "1.1.1.1:443"
+	attempts := 0
+
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-time.After(healthCheckInterval):
+			if isPortAlive(checkTarget) {
+				attempts = 0
+				continue
+			}
+
+			if attempts >= maxReconnects {
+				msg := "TUN: max reconnect attempts reached, giving up"
+				log.Println(msg)
+				logger.Error(msg)
+				return
+			}
+			attempts++
+			log.Printf("TUN health check failed, reconnecting (attempt %d/%d)...", attempts, maxReconnects)
+			logger.Warnf("TUN health check failed, reconnect attempt %d/%d", attempts, maxReconnects)
+
+			time.Sleep(reconnectDelay)
+			if err := m.startCore(); err != nil {
+				log.Printf("TUN reconnect failed: %v", err)
+				logger.Errorf("TUN reconnect failed: %v", err)
+			} else {
+				log.Println("TUN reconnected successfully")
+				logger.Info("TUN reconnected successfully")
+			}
+		}
+	}
+}
+
 func isPortAlive(addr string) bool {
-	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	conn, err := net.DialTimeout("tcp", addr, 4*time.Second)
 	if err != nil {
 		return false
 	}

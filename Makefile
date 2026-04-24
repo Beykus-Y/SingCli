@@ -1,4 +1,4 @@
-TAGS = with_quic,with_utls,with_xtls
+TAGS = with_quic,with_utls,with_xtls,with_gvisor
 OUTPUT = bin/singcli.exe
 
 build:
