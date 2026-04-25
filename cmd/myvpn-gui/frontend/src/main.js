@@ -8,6 +8,10 @@ const speedTestResults = {}; // { [serverId]: { loading, latencyMs, error } }
 let speedTestAllRunning = false;
 let speedTestAllStop = false;
 const speedTestProgress = { current: 0, total: 0 };
+let serverFilter = '';
+let sortBySpeed = false;
+let copiedProxy = '';
+let copiedProxyTimer = null;
 
 const state = {
   servers: [],
@@ -22,6 +26,13 @@ const state = {
   logs: [],
   proxySocks: '127.0.0.1:1080',
   proxyHTTP: '127.0.0.1:1081',
+  connectedAt: '',
+  traffic: {
+    sessionDownloadBytes: 0,
+    sessionUploadBytes: 0,
+    downloadBytesPerSec: 0,
+    uploadBytesPerSec: 0,
+  },
 };
 
 const subscriptionForm = {
@@ -33,6 +44,13 @@ const subscriptionForm = {
 };
 
 let refreshingSubscriptionId = null;
+
+const importForm = {
+  source: '',
+  busy: false,
+  message: '',
+  error: '',
+};
 
 // === Core helpers ===
 function backend() {
@@ -51,6 +69,14 @@ function escapeHTML(value) {
 function mergeState(next) {
   Object.assign(state, next || {});
   if (!state.mode) state.mode = 'proxy';
+  if (!state.traffic) {
+    state.traffic = {
+      sessionDownloadBytes: 0,
+      sessionUploadBytes: 0,
+      downloadBytesPerSec: 0,
+      uploadBytesPerSec: 0,
+    };
+  }
   render();
 }
 
@@ -81,6 +107,29 @@ function formatDate(value) {
   return date.toLocaleString();
 }
 
+function formatDurationSince(value) {
+  if (!value) return '';
+  const start = new Date(value);
+  if (Number.isNaN(start.getTime())) return '';
+  const minutes = Math.max(0, Math.floor((Date.now() - start.getTime()) / 60000));
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  if (hours > 0) return `${hours}h ${rest}m`;
+  return `${rest}m`;
+}
+
+function formatSpeed(value) {
+  const mb = Number(value || 0) / 1024 / 1024;
+  return `${mb >= 10 ? mb.toFixed(1) : mb.toFixed(2)} MB/s`;
+}
+
+function bestTestedServer() {
+  return state.servers
+    .map((server) => ({ server, result: speedTestResults[server.id] }))
+    .filter(({ result }) => result && !result.loading && !result.error && result.latencyMs >= 0)
+    .sort((a, b) => a.result.latencyMs - b.result.latencyMs)[0]?.server || null;
+}
+
 // === Server grouping ===
 function groupedServers() {
   const local = [];
@@ -94,6 +143,37 @@ function groupedServers() {
     }
   }
   return { local, bySubId };
+}
+
+function serverMatchesFilter(server) {
+  const query = serverFilter.trim().toLowerCase();
+  if (!query) return true;
+  return `${server.name} ${server.address}`.toLowerCase().includes(query);
+}
+
+function sortServersForDisplay(servers) {
+  const filtered = servers.filter(serverMatchesFilter);
+  if (!sortBySpeed) return filtered;
+  return filtered
+    .map((server, index) => ({ server, index, result: speedTestResults[server.id] }))
+    .sort((a, b) => {
+      const ar = speedRank(a.result);
+      const br = speedRank(b.result);
+      if (ar.bucket !== br.bucket) return ar.bucket - br.bucket;
+      if (ar.latency !== br.latency) return ar.latency - br.latency;
+      return a.index - b.index;
+    })
+    .map((item) => item.server);
+}
+
+function speedRank(result) {
+  if (result && !result.loading && !result.error && result.latencyMs >= 0) {
+    return { bucket: 0, latency: result.latencyMs };
+  }
+  if (result && (result.error || result.latencyMs < 0)) {
+    return { bucket: 2, latency: Number.MAX_SAFE_INTEGER };
+  }
+  return { bucket: 1, latency: Number.MAX_SAFE_INTEGER };
 }
 
 // === Server select options (with optgroups) ===
@@ -242,6 +322,7 @@ async function runSpeedTestAll() {
 
 // === Render: Topbar ===
 function renderTopbar() {
+  const elapsed = state.running ? formatDurationSince(state.connectedAt) : '';
   return `
     <header class="topbar">
       <div class="topbar-brand" style="--wails-draggable:drag">
@@ -252,7 +333,10 @@ function renderTopbar() {
         <button class="nav-tab ${currentPage === 'home' ? 'active' : ''}" data-nav="home">Home</button>
         <button class="nav-tab ${currentPage === 'servers' ? 'active' : ''}" data-nav="servers">Servers</button>
       </nav>
-      <span class="status ${statusTone()}" style="--wails-draggable:no-drag">${escapeHTML(state.status)}</span>
+      <span class="status ${statusTone()}" style="--wails-draggable:no-drag">
+        ${escapeHTML(state.status)}
+        ${elapsed ? `<span class="status-elapsed">${escapeHTML(elapsed)}</span>` : ''}
+      </span>
     </header>
   `;
 }
@@ -262,17 +346,21 @@ function renderHomePage() {
   const disabled = state.running || state.connecting;
   const primaryLabel = disabled ? 'Disconnect' : 'Connect';
   const primaryDisabled = disabled ? !state.canDisconnect : !state.canConnect;
+  const bestServer = bestTestedServer();
   const logs = state.logs.length
     ? state.logs.map((line) => `<div>${escapeHTML(line)}</div>`).join('')
     : '<div class="muted">No events yet</div>';
 
   return `
     <section class="panel control-panel">
-      <label class="field">
+      <label class="field server-field">
         <span>Server</span>
-        <select id="server" ${disabled || !state.servers.length ? 'disabled' : ''}>
-          ${serverSelectOptions()}
-        </select>
+        <div class="server-select-row">
+          <select id="server" ${disabled || !state.servers.length ? 'disabled' : ''}>
+            ${serverSelectOptions()}
+          </select>
+          <button id="best-server" title="Select fastest tested server" ${disabled || !bestServer ? 'disabled' : ''}>Best</button>
+        </div>
       </label>
       <div class="field">
         <span>Mode</span>
@@ -287,14 +375,24 @@ function renderHomePage() {
     </section>
 
     <section class="info-grid">
-      <div class="metric">
-        <span>SOCKS5</span>
+      <button class="metric copy-metric" data-copy-proxy="socks" data-copy-value="${escapeHTML(state.proxySocks)}" title="Copy SOCKS5 address">
+        <span>SOCKS5 ${copiedProxy === 'socks' ? '<em>Copied</em>' : ''}</span>
         <strong>${escapeHTML(state.proxySocks)}</strong>
-      </div>
-      <div class="metric">
-        <span>HTTP</span>
+      </button>
+      <button class="metric copy-metric" data-copy-proxy="http" data-copy-value="${escapeHTML(state.proxyHTTP)}" title="Copy HTTP address">
+        <span>HTTP ${copiedProxy === 'http' ? '<em>Copied</em>' : ''}</span>
         <strong>${escapeHTML(state.proxyHTTP)}</strong>
-      </div>
+      </button>
+      ${state.running ? `
+        <div class="metric">
+          <span>Session</span>
+          <strong>↓ ${escapeHTML(formatBytes(state.traffic.sessionDownloadBytes))} / ↑ ${escapeHTML(formatBytes(state.traffic.sessionUploadBytes))}</strong>
+        </div>
+        <div class="metric">
+          <span>Speed</span>
+          <strong>↓ ${escapeHTML(formatSpeed(state.traffic.downloadBytesPerSec))} ↑ ${escapeHTML(formatSpeed(state.traffic.uploadBytesPerSec))}</strong>
+        </div>
+      ` : ''}
     </section>
 
     <section class="panel subscription-panel">
@@ -360,7 +458,9 @@ function renderServerCard(server, isLocal) {
 // === Render: Servers page ===
 function renderServersPage() {
   const { local, bySubId } = groupedServers();
-  const total = state.servers.length;
+  const visibleLocal = sortServersForDisplay(local);
+  const total = state.servers.filter(serverMatchesFilter).length;
+  const hasSpeedResults = Object.keys(speedTestResults).length > 0;
 
   const testAllLabel = speedTestAllRunning
     ? `Stop (${speedTestProgress.current}/${speedTestProgress.total})`
@@ -371,8 +471,21 @@ function renderServersPage() {
       <h2>Servers <span class="count-pill">${total}</span></h2>
       <div class="page-header-actions">
         <button id="test-all-btn" class="${speedTestAllRunning ? 'test-all-running' : ''}">${testAllLabel}</button>
+        <button id="sort-speed-btn" class="${sortBySpeed ? 'active-action' : ''}" ${!hasSpeedResults ? 'disabled' : ''}>Sort by speed</button>
         <button id="reload-servers-page">Reload</button>
       </div>
+    </div>
+
+    <div class="server-tools">
+      <div class="server-import">
+        <input id="server-import-source" placeholder="vless://... / ss://... / hysteria2://..." value="${escapeHTML(importForm.source)}" ${importForm.busy ? 'disabled' : ''}>
+        <button id="server-import-btn" class="primary" ${importForm.busy || !importForm.source.trim() ? 'disabled' : ''}>
+          ${importForm.busy ? 'Importing…' : 'Import'}
+        </button>
+      </div>
+      <input id="server-filter" placeholder="Search servers" value="${escapeHTML(serverFilter)}">
+      ${importForm.message ? `<div class="import-message">${escapeHTML(importForm.message)}</div>` : ''}
+      ${importForm.error ? `<div class="import-message error">${escapeHTML(importForm.error)}</div>` : ''}
     </div>
   `;
 
@@ -381,17 +494,17 @@ function renderServersPage() {
     <div class="server-group">
       <div class="server-group-header">
         <span>Local</span>
-        <span class="group-count">${local.length}</span>
+        <span class="group-count">${visibleLocal.length}</span>
       </div>
-      ${local.length === 0
+      ${visibleLocal.length === 0
         ? '<div class="group-empty muted">No local servers.</div>'
-        : local.map((s) => renderServerCard(s, true)).join('')}
+        : visibleLocal.map((s) => renderServerCard(s, true)).join('')}
     </div>
   `;
 
   // Subscription groups — follow state.subscriptions order
   for (const sub of state.subscriptions) {
-    const servers = bySubId[sub.id] || [];
+    const servers = sortServersForDisplay(bySubId[sub.id] || []);
     html += `
       <div class="server-group">
         <div class="server-group-header">
@@ -409,13 +522,16 @@ function renderServersPage() {
   // Unknown subscription groups (edge case)
   for (const [subId, servers] of Object.entries(bySubId)) {
     if (state.subscriptions.find((s) => s.id == subId)) continue;
+    const visibleServers = sortServersForDisplay(servers);
     html += `
       <div class="server-group">
         <div class="server-group-header">
           <span>Subscription #${escapeHTML(subId)}</span>
-          <span class="group-count">${servers.length}</span>
+          <span class="group-count">${visibleServers.length}</span>
         </div>
-        ${servers.map((s) => renderServerCard(s, false)).join('')}
+        ${visibleServers.length === 0
+          ? '<div class="group-empty muted">No matching servers.</div>'
+          : visibleServers.map((s) => renderServerCard(s, false)).join('')}
       </div>
     `;
   }
@@ -463,6 +579,13 @@ function bindHomeControls() {
     render();
   });
 
+  document.querySelector('#best-server')?.addEventListener('click', () => {
+    const best = bestTestedServer();
+    if (!best) return;
+    state.selectedServer = best.name;
+    render();
+  });
+
   document.querySelector('#mode-proxy')?.addEventListener('click', () => {
     state.mode = 'proxy';
     render();
@@ -490,6 +613,29 @@ function bindHomeControls() {
 
   document.querySelector('#reload-subscriptions')?.addEventListener('click', async () => {
     await loadSubscriptions();
+  });
+
+  document.querySelectorAll('[data-copy-proxy]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const value = btn.dataset.copyValue;
+      if (!value) return;
+      try {
+        if (window.runtime?.ClipboardSetText) {
+          await window.runtime.ClipboardSetText(value);
+        } else if (navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(value);
+        }
+        copiedProxy = btn.dataset.copyProxy;
+        window.clearTimeout(copiedProxyTimer);
+        copiedProxyTimer = window.setTimeout(() => {
+          copiedProxy = '';
+          render();
+        }, 1200);
+        render();
+      } catch (err) {
+        console.error(err);
+      }
+    });
   });
 
   document.querySelector('#subscription-name')?.addEventListener('input', (e) => {
@@ -590,6 +736,49 @@ function bindServersControls() {
     runSpeedTestAll();
   });
 
+  document.querySelector('#sort-speed-btn')?.addEventListener('click', () => {
+    sortBySpeed = true;
+    render();
+  });
+
+  document.querySelector('#server-filter')?.addEventListener('input', (e) => {
+    const pos = e.target.selectionStart;
+    serverFilter = e.target.value;
+    render();
+    const input = document.querySelector('#server-filter');
+    input?.focus();
+    input?.setSelectionRange(pos, pos);
+  });
+
+  document.querySelector('#server-import-source')?.addEventListener('input', (e) => {
+    importForm.source = e.target.value;
+    importForm.message = '';
+    importForm.error = '';
+    const importButton = document.querySelector('#server-import-btn');
+    if (importButton) importButton.disabled = !importForm.source.trim();
+  });
+
+  document.querySelector('#server-import-btn')?.addEventListener('click', async () => {
+    const api = backend();
+    if (!api || !importForm.source.trim()) return;
+    importForm.busy = true;
+    importForm.message = '';
+    importForm.error = '';
+    render();
+    try {
+      const result = await api.ImportServers(importForm.source.trim());
+      importForm.source = '';
+      importForm.message = result?.imported ? `Imported ${result.count} server(s).` : 'No servers imported.';
+      await loadSubscriptions();
+      mergeState(await api.GetState());
+    } catch (err) {
+      importForm.error = String(err);
+    } finally {
+      importForm.busy = false;
+      render();
+    }
+  });
+
   document.querySelectorAll('[data-use-server]').forEach((btn) => {
     btn.addEventListener('click', () => {
       state.selectedServer = btn.dataset.useServer;
@@ -638,6 +827,9 @@ async function loadSubscriptions() {
 // === Init ===
 async function init() {
   render();
+  window.setInterval(() => {
+    if (state.running) render();
+  }, 60000);
 
   window.runtime?.EventsOn?.('state', (next) => mergeState(next));
   window.runtime?.EventsOn?.('log', (line) => {

@@ -21,6 +21,8 @@ type FetchOptions struct {
 	URL          string
 	ETag         string
 	LastModified string
+	DeviceID     string
+	DeviceName   string
 }
 
 type FetchResult struct {
@@ -39,6 +41,13 @@ func Fetch(ctx context.Context, client *http.Client, options FetchOptions) (Fetc
 	}
 	req.Header.Set("User-Agent", "MGB VPN/1.0")
 	req.Header.Set("Accept", "text/plain, application/json, */*")
+	if options.DeviceID != "" {
+		req.Header.Set("X-Device-ID", options.DeviceID)
+		req.Header.Set("X-HWID", options.DeviceID)
+	}
+	if options.DeviceName != "" {
+		req.Header.Set("X-Device-Name", options.DeviceName)
+	}
 	if options.ETag != "" {
 		req.Header.Set("If-None-Match", options.ETag)
 	}

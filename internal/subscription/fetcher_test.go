@@ -65,6 +65,34 @@ func TestFetchNotModified(t *testing.T) {
 	}
 }
 
+func TestFetchSendsDeviceHeaders(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if got := req.Header.Get("X-Device-ID"); got != "machine-guid" {
+			t.Fatalf("X-Device-ID = %q, want machine-guid", got)
+		}
+		if got := req.Header.Get("X-HWID"); got != "machine-guid" {
+			t.Fatalf("X-HWID = %q, want machine-guid", got)
+		}
+		if got := req.Header.Get("X-Device-Name"); got != "desktop" {
+			t.Fatalf("X-Device-Name = %q, want desktop", got)
+		}
+		if got := req.Header.Get("If-Modified-Since"); got != "Mon, 01 Jan 2024 00:00:00 GMT" {
+			t.Fatalf("If-Modified-Since = %q", got)
+		}
+		return response(http.StatusOK, nil, "hysteria2://secret@example.com:443#hy2"), nil
+	})}
+
+	_, err := Fetch(context.Background(), client, FetchOptions{
+		URL:          "https://example.com/sub",
+		LastModified: "Mon, 01 Jan 2024 00:00:00 GMT",
+		DeviceID:     "machine-guid",
+		DeviceName:   "desktop",
+	})
+	if err != nil {
+		t.Fatalf("Fetch() error = %v", err)
+	}
+}
+
 func stringInt(value int64) string {
 	return strconv.FormatInt(value, 10)
 }

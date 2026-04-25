@@ -105,6 +105,24 @@ export namespace config {
 
 export namespace main {
 	
+	export class TrafficState {
+	    sessionDownloadBytes: number;
+	    sessionUploadBytes: number;
+	    downloadBytesPerSec: number;
+	    uploadBytesPerSec: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new TrafficState(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.sessionDownloadBytes = source["sessionDownloadBytes"];
+	        this.sessionUploadBytes = source["sessionUploadBytes"];
+	        this.downloadBytesPerSec = source["downloadBytesPerSec"];
+	        this.uploadBytesPerSec = source["uploadBytesPerSec"];
+	    }
+	}
 	export class ServerSummary {
 	    id: number;
 	    name: string;
@@ -137,6 +155,8 @@ export namespace main {
 	    logs: string[];
 	    proxySocks: string;
 	    proxyHTTP: string;
+	    connectedAt?: string;
+	    traffic: TrafficState;
 	
 	    static createFrom(source: any = {}) {
 	        return new AppState(source);
@@ -155,6 +175,8 @@ export namespace main {
 	        this.logs = source["logs"];
 	        this.proxySocks = source["proxySocks"];
 	        this.proxyHTTP = source["proxyHTTP"];
+	        this.connectedAt = source["connectedAt"];
+	        this.traffic = this.convertValues(source["traffic"], TrafficState);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -189,6 +211,7 @@ export namespace main {
 	        this.error = source["error"];
 	    }
 	}
+	
 
 }
 

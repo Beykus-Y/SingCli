@@ -245,6 +245,26 @@ func TestImportServersFromCandidatesOnce(t *testing.T) {
 	}
 }
 
+func TestImportServersFromBytes(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "mgb.db"))
+	defer store.Close()
+
+	result, err := store.ImportServersFromBytes("inline", []byte("hysteria2://secret@example.com:443#hy2"))
+	if err != nil {
+		t.Fatalf("ImportServersFromBytes() error = %v", err)
+	}
+	if !result.Imported || result.Count != 1 || result.Path != "inline" {
+		t.Fatalf("import result = %#v, want inline import", result)
+	}
+	records, err := store.ListServers()
+	if err != nil {
+		t.Fatalf("ListServers() error = %v", err)
+	}
+	if len(records) != 1 || records[0].Name != "hy2" || records[0].Address != "example.com:443" {
+		t.Fatalf("records = %#v, want imported hy2", records)
+	}
+}
+
 func openTestStore(t *testing.T, path string) *Store {
 	t.Helper()
 	store, err := Open(path)

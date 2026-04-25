@@ -401,6 +401,18 @@ func (s *Store) ImportServersFromPath(path string) (ImportResult, error) {
 	return ImportResult{Imported: true, Path: path, Count: count}, nil
 }
 
+func (s *Store) ImportServersFromBytes(source string, data []byte) (ImportResult, error) {
+	servers, err := config.LoadServersFromBytes(data)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	count, err := s.ImportServers(servers)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	return ImportResult{Imported: true, Path: source, Count: count}, nil
+}
+
 func (s *Store) ImportServersFromCandidatesOnce(paths []string) (ImportResult, error) {
 	if value, ok, err := s.GetSetting(importedSettingKey); err != nil {
 		return ImportResult{}, err

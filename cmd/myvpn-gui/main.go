@@ -17,10 +17,13 @@ import (
 
 	"SingCli/internal/config"
 	"SingCli/internal/core"
+	"SingCli/internal/deviceid"
 	"SingCli/internal/logger"
+	"SingCli/internal/netstats"
 	"SingCli/internal/storage"
 	subfetch "SingCli/internal/subscription"
 	"SingCli/internal/tunnel"
+	"SingCli/internal/tunsettings"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -62,6 +65,15 @@ type AppState struct {
 	Logs           []string        `json:"logs"`
 	ProxySocks     string          `json:"proxySocks"`
 	ProxyHTTP      string          `json:"proxyHTTP"`
+	ConnectedAt    string          `json:"connectedAt,omitempty"`
+	Traffic        TrafficState    `json:"traffic"`
+}
+
+type TrafficState struct {
+	SessionDownloadBytes uint64 `json:"sessionDownloadBytes"`
+	SessionUploadBytes   uint64 `json:"sessionUploadBytes"`
+	DownloadBytesPerSec  uint64 `json:"downloadBytesPerSec"`
+	UploadBytesPerSec    uint64 `json:"uploadBytesPerSec"`
 }
 
 type App struct {
@@ -77,10 +89,16 @@ type App struct {
 	manager        *tunnel.Manager
 	running        bool
 	connecting     bool
+	connectedAt    time.Time
+	traffic        TrafficState
 	connectionID   uint64
 	refreshMu      sync.Mutex
 	httpClient     *http.Client
 	autoCancel     context.CancelFunc
+	trafficCancel  context.CancelFunc
+	deviceInfo     deviceid.Info
+	tray           *trayService
+	quitting       bool
 }
 
 func main() {
@@ -96,21 +114,22 @@ func main() {
 
 	app := NewApp()
 	if err := wails.Run(&options.App{
-		Title:            "MGB VPN",
-		Width:            760,
-		Height:           560,
-		MinWidth:         680,
-		MinHeight:        500,
-		DisableResize:    false,
-		Fullscreen:       false,
-		Frameless:        false,
-		Bind:             []interface{}{app},
-		OnStartup:        app.Startup,
-		OnShutdown:       app.Shutdown,
-		BackgroundColour: &options.RGBA{R: 12, G: 15, B: 23, A: 255},
-		AssetServer:      &assetserver.Options{Assets: assets},
-		CSSDragProperty:  "--wails-draggable",
-		CSSDragValue:     "drag",
+		Title:             "MGB VPN",
+		Width:             760,
+		Height:            560,
+		MinWidth:          680,
+		MinHeight:         500,
+		DisableResize:     false,
+		Fullscreen:        false,
+		Frameless:         false,
+		HideWindowOnClose: hideWindowOnClose(),
+		Bind:              []interface{}{app},
+		OnStartup:         app.Startup,
+		OnShutdown:        app.Shutdown,
+		BackgroundColour:  &options.RGBA{R: 12, G: 15, B: 23, A: 255},
+		AssetServer:       &assetserver.Options{Assets: assets},
+		CSSDragProperty:   "--wails-draggable",
+		CSSDragValue:      "drag",
 	}); err != nil {
 		log.Fatal(err)
 	}
@@ -122,6 +141,7 @@ func NewApp() *App {
 		status:     "Loading servers...",
 		logs:       make([]string, 0, 64),
 		httpClient: &http.Client{Timeout: 45 * time.Second},
+		deviceInfo: deviceid.Get(),
 	}
 }
 
@@ -136,6 +156,8 @@ func (a *App) Startup(ctx context.Context) {
 		a.emitState(state)
 		return
 	}
+	a.tray = newTrayService(a)
+	a.tray.Start(ctx)
 	a.startAutoRefresh(ctx)
 	a.ReloadServers()
 }
@@ -143,6 +165,10 @@ func (a *App) Startup(ctx context.Context) {
 func (a *App) Shutdown(ctx context.Context) {
 	if a.autoCancel != nil {
 		a.autoCancel()
+	}
+	a.stopTrafficMonitor()
+	if a.tray != nil {
+		a.tray.Stop()
 	}
 	a.Disconnect()
 	if a.store != nil {
@@ -303,7 +329,7 @@ func (a *App) SetServerSubscription(serverID int64, subscriptionID *int64) error
 	return nil
 }
 
-func (a *App) ImportServers(path string) (storage.ImportResult, error) {
+func (a *App) ImportServers(source string) (storage.ImportResult, error) {
 	if err := a.ensureStorage(); err != nil {
 		return storage.ImportResult{}, err
 	}
@@ -312,10 +338,13 @@ func (a *App) ImportServers(path string) (storage.ImportResult, error) {
 		result storage.ImportResult
 		err    error
 	)
-	if strings.TrimSpace(path) == "" {
+	source = strings.TrimSpace(source)
+	if source == "" {
 		result, err = a.store.ImportServersFromCandidatesOnce(config.FindServersConfigCandidates())
+	} else if shouldImportInline(source) {
+		result, err = a.store.ImportServersFromBytes("inline", []byte(source))
 	} else {
-		result, err = a.store.ImportServersFromPath(path)
+		result, err = a.store.ImportServersFromPath(source)
 	}
 	if err != nil {
 		return storage.ImportResult{}, err
@@ -425,7 +454,10 @@ func (a *App) Disconnect() AppState {
 	wasRunning := a.running || a.connecting
 	a.running = false
 	a.connecting = false
+	a.connectedAt = time.Time{}
+	a.traffic = TrafficState{}
 	a.connectionID++
+	a.stopTrafficMonitorLocked()
 	a.mu.Unlock()
 
 	if mgr != nil {
@@ -479,6 +511,9 @@ func (a *App) connectAsync(connectionID uint64, server config.ServerEntry, mode 
 		a.manager = nil
 		a.running = false
 		a.connecting = false
+		a.connectedAt = time.Time{}
+		a.traffic = TrafficState{}
+		a.stopTrafficMonitorLocked()
 		a.status = "Connection failed"
 		a.appendLogLocked(fmt.Sprintf("Connection failed: %v", err))
 		state := a.stateLocked()
@@ -496,6 +531,9 @@ func (a *App) connectAsync(connectionID uint64, server config.ServerEntry, mode 
 	a.manager = mgr
 	a.running = true
 	a.connecting = false
+	a.connectedAt = time.Now().UTC()
+	a.traffic = TrafficState{}
+	a.startTrafficMonitorLocked(connectionID, mode)
 	a.status = "Connected"
 	a.appendLogLocked(fmt.Sprintf("Connected to %s", server.Name))
 	state := a.stateLocked()
@@ -536,6 +574,10 @@ func (a *App) stateLocked() AppState {
 
 	logs := append([]string(nil), a.logs...)
 	canConnect := len(a.servers) > 0 && !a.running && !a.connecting
+	connectedAt := ""
+	if !a.connectedAt.IsZero() {
+		connectedAt = a.connectedAt.Format(time.RFC3339)
+	}
 	return AppState{
 		Servers:        servers,
 		SelectedServer: a.selectedServer,
@@ -548,6 +590,8 @@ func (a *App) stateLocked() AppState {
 		Logs:           logs,
 		ProxySocks:     socksAddr,
 		ProxyHTTP:      httpAddr,
+		ConnectedAt:    connectedAt,
+		Traffic:        a.traffic,
 	}
 }
 
@@ -595,7 +639,9 @@ func (a *App) refreshSubscription(ctx context.Context, subscriptionID int64) (st
 	defer cancel()
 
 	options := subfetch.FetchOptions{
-		URL: subscription.URL,
+		URL:        subscription.URL,
+		DeviceID:   a.deviceInfo.ID,
+		DeviceName: a.deviceInfo.Name,
 	}
 	if subscription.ETag != nil {
 		options.ETag = *subscription.ETag
@@ -634,6 +680,109 @@ func (a *App) refreshSubscription(ctx context.Context, subscriptionID int64) (st
 	a.mu.Unlock()
 	a.ReloadServers()
 	return refreshResult, nil
+}
+
+func shouldImportInline(source string) bool {
+	lower := strings.ToLower(source)
+	if strings.HasPrefix(lower, "vless://") ||
+		strings.HasPrefix(lower, "ss://") ||
+		strings.HasPrefix(lower, "hysteria2://") ||
+		strings.HasPrefix(source, "{") ||
+		strings.ContainsAny(source, "\r\n") {
+		return true
+	}
+	_, err := config.LoadServersFromBytes([]byte(source))
+	return err == nil
+}
+
+func (a *App) startTrafficMonitorLocked(connectionID uint64, mode string) {
+	a.stopTrafficMonitorLocked()
+	monitorCtx, cancel := context.WithCancel(context.Background())
+	a.trafficCancel = cancel
+
+	go a.runTrafficMonitor(monitorCtx, connectionID, mode)
+}
+
+func (a *App) stopTrafficMonitor() {
+	a.mu.Lock()
+	a.stopTrafficMonitorLocked()
+	a.mu.Unlock()
+}
+
+func (a *App) stopTrafficMonitorLocked() {
+	if a.trafficCancel != nil {
+		a.trafficCancel()
+		a.trafficCancel = nil
+	}
+}
+
+func (a *App) runTrafficMonitor(ctx context.Context, connectionID uint64, mode string) {
+	statsMode := netstats.ModeProxy
+	if mode == modeTun {
+		statsMode = netstats.ModeTun
+	}
+
+	base, _, err := netstats.Read(statsMode, tunsettings.InterfaceName)
+	if err != nil {
+		a.mu.Lock()
+		a.appendLogLocked(fmt.Sprintf("Traffic counters unavailable: %v", err))
+		a.mu.Unlock()
+		return
+	}
+	prev := base
+	prevTime := time.Now()
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			current, _, err := netstats.Read(statsMode, tunsettings.InterfaceName)
+			if err != nil {
+				a.mu.Lock()
+				a.appendLogLocked(fmt.Sprintf("Traffic counters unavailable: %v", err))
+				a.mu.Unlock()
+				return
+			}
+
+			elapsed := now.Sub(prevTime).Seconds()
+			if elapsed <= 0 {
+				elapsed = 1
+			}
+			downloadDelta := deltaCounter(current.DownloadBytes, prev.DownloadBytes)
+			uploadDelta := deltaCounter(current.UploadBytes, prev.UploadBytes)
+			sessionDownload := deltaCounter(current.DownloadBytes, base.DownloadBytes)
+			sessionUpload := deltaCounter(current.UploadBytes, base.UploadBytes)
+
+			a.mu.Lock()
+			if connectionID != a.connectionID || !a.running {
+				a.mu.Unlock()
+				return
+			}
+			a.traffic = TrafficState{
+				SessionDownloadBytes: sessionDownload,
+				SessionUploadBytes:   sessionUpload,
+				DownloadBytesPerSec:  uint64(float64(downloadDelta) / elapsed),
+				UploadBytesPerSec:    uint64(float64(uploadDelta) / elapsed),
+			}
+			state := a.stateLocked()
+			a.mu.Unlock()
+			a.emitState(state)
+
+			prev = current
+			prevTime = now
+		}
+	}
+}
+
+func deltaCounter(current, previous uint64) uint64 {
+	if current < previous {
+		return 0
+	}
+	return current - previous
 }
 
 func (a *App) startAutoRefresh(ctx context.Context) {
